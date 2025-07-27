@@ -66,8 +66,8 @@ def get_mode():
     cur.execute('SELECT value FROM settings WHERE key = "msg_mode"')
     return cur.fetchone()[0]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command in PM."""
+async def add_user_and_notify_if_first(update: Update, context: ContextTypes.DEFAULT_TYPE, is_start: bool = False) -> bool:
+    """Add user to DB and notify if first time. Returns if it was first."""
     user = update.message.from_user
     user_id = user.id
     username = user.username
@@ -92,6 +92,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cur.execute('INSERT OR IGNORE INTO bans (user_id) VALUES (?)', (user_id,))
     conn.commit()
 
+    if is_first:
+        # Notify admin on first start/message
+        premium_status = "⭐ Premium" if is_premium else "Non-Premium"
+        username_display = f'@{username}' if username else 'NONE'
+        direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
+        info_text = f'🆕 New user {"started the bot" if is_start else "sent a message"}!\nName: {first_name}\nID: <a href="tg://user?id={user_id}">{user_id}</a>\nUsername: {username_display}\nStatus: {premium_status}\nDirect: {direct_link}'
+
+        ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
+
+        current_mode = get_mode()
+
+        if current_mode == "topic":
+            # For topic mode, need topic_id
+            cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
+            row = cur.fetchone()
+            topic_id = row[0] if row else None  # Assume created in caller if needed
+            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+            await send_func(
+                chat_id=GROUP_ID,
+                photo=profile_photo_id if profile_photo_id else None,
+                caption=info_text if profile_photo_id else None,
+                text=info_text if not profile_photo_id else None,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=topic_id
+            )
+        else:
+            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+            await send_func(
+                chat_id=ADMIN_ID,
+                photo=profile_photo_id if profile_photo_id else None,
+                caption=info_text if profile_photo_id else None,
+                text=info_text if not profile_photo_id else None,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML
+            )
+
+    return is_first
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command in PM."""
+    user_id = update.message.from_user.id
+
     if user_id == ADMIN_ID:
         # Admin specific message
         current_mode = get_mode()
@@ -114,9 +157,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(admin_text, reply_markup=mode_buttons)
         return
 
+    # Add user and notify if first
+    await add_user_and_notify_if_first(update, context, is_start=True)
+
     # Regular user welcome
+    user = update.message.from_user
+    first_name = user.first_name or "User"
     button = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 HazexPy", url="t.me/HazexPy")]])
     welcome_text = f"👋 Welcome, {first_name}! Send me any message, and I'll forward it to the owner anonymously."
+
+    cur.execute('SELECT profile_photo_id FROM users WHERE user_id = ?', (user_id,))
+    profile_photo_id = cur.fetchone()[0]
 
     if profile_photo_id:
         await update.message.reply_photo(photo=profile_photo_id, caption=welcome_text, reply_markup=button)
@@ -125,14 +176,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     current_mode = get_mode()
 
-    # Create or get topic if topic mode
-    topic_id = None
+    # Create topic if topic mode and not exists
     if current_mode == "topic":
         cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-        row = cur.fetchone()
-        if row:
-            topic_id = row[0]
-        else:
+        if not cur.fetchone():
             try:
                 new_topic = await context.bot.create_forum_topic(
                     chat_id=GROUP_ID,
@@ -143,44 +190,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 conn.commit()
             except BadRequest as e:
                 logger.error(f"Failed to create topic: {e}")
-                return
-
-    if is_first:
-        # Notify admin on first start
-        premium_status = "⭐ Premium" if is_premium else "Non-Premium"
-        username_display = f'@{username}' if username else 'NONE'
-        direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
-        info_text = f'🆕 New user started the bot!\nName: {first_name}\nID: <a href="tg://user?id={user_id}">{user_id}</a>\nUsername: {username_display}\nStatus: {premium_status}\nDirect: {direct_link}'
-
-        ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
-
-        if current_mode == "topic":
-            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
-            await send_func(
-                chat_id=GROUP_ID,
-                photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else None,
-                text=info_text if not profile_photo_id else None,
-                reply_markup=ban_button,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=topic_id
-            )
-        else:
-            # Bot mode: Send to admin PM and store mapping if needed (for info, optional)
-            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
-            sent_msg = await send_func(
-                chat_id=ADMIN_ID,
-                photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else None,
-                text=info_text if not profile_photo_id else None,
-                reply_markup=ban_button,
-                parse_mode=ParseMode.HTML
-            )
-            # Optional: Store mapping for reply to info msg if desired, but skip for now
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward private messages to the admin."""
     user_id = update.message.from_user.id
+
+    # Add user and notify if first
+    await add_user_and_notify_if_first(update, context)
 
     # Check if banned
     cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
