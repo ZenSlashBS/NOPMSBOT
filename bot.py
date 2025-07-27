@@ -78,8 +78,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(welcome_text, reply_markup=button)
 
+    # Create or get topic
+    cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    if row:
+        topic_id = row[0]
+    else:
+        try:
+            new_topic = await context.bot.create_forum_topic(
+                chat_id=GROUP_ID,
+                name=f"Message from {first_name} ({user_id})"
+            )
+            topic_id = new_topic.message_thread_id
+            cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
+            conn.commit()
+        except BadRequest as e:
+            logger.error(f"Failed to create topic: {e}")
+            return  # No notification if can't create topic
+
     if is_first:
-        # Notify group only on first start
+        # Notify group only on first start, in the user's topic
         premium_status = "⭐ Premium" if is_premium else "Non-Premium"
         username_display = f'@{username}' if username else 'NONE'
         direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
@@ -88,9 +106,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
 
         if profile_photo_id:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=profile_photo_id, caption=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML)
+            await context.bot.send_photo(chat_id=GROUP_ID, photo=profile_photo_id, caption=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
         else:
-            await context.bot.send_message(chat_id=GROUP_ID, text=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=GROUP_ID, text=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward private messages to the group topic."""
@@ -102,7 +120,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     is_banned = row[0] if row else 0
 
     if is_banned:
-        await update.message.reply_text("🚫 You are banned by the admin. Your messages are still seen but no replies.")
+        await update.message.reply_text("🚫 You are banned by the admin.")
         msg_prefix = "Banned Msg: 🤫 "
     else:
         msg_prefix = ""
@@ -218,9 +236,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             uid = row[0]
             try:
                 if message.photo:
-                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption, reply_markup=user_markup)
+                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption, reply_markup=user_markup, parse_mode=ParseMode.HTML)
                 else:
-                    await context.bot.send_message(chat_id=uid, text=message.text, reply_markup=user_markup)
+                    await context.bot.send_message(chat_id=uid, text=message.text, reply_markup=user_markup, parse_mode=ParseMode.HTML)
                 sent_count += 1
             except Exception as e:
                 logger.warning(f"Failed to send to {uid}: {e}")
@@ -279,12 +297,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Send preview
     if img_url:
         try:
-            await update.message.reply_photo(photo=img_url, caption=msg, reply_markup=full_markup)
+            await update.message.reply_photo(photo=img_url, caption=msg, reply_markup=full_markup, parse_mode=ParseMode.HTML)
         except Exception as e:
             await update.message.reply_text(f"Error with image: {e}")
             return
     else:
-        await update.message.reply_text(text=msg, reply_markup=full_markup)
+        await update.message.reply_text(text=msg, reply_markup=full_markup, parse_mode=ParseMode.HTML)
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /users command."""
