@@ -47,6 +47,12 @@ cur.execute('''
         value TEXT
     )
 ''')
+cur.execute('''
+    CREATE TABLE IF NOT EXISTS message_mappings (
+        msg_id INTEGER PRIMARY KEY,
+        user_id INTEGER
+    )
+''')
 conn.commit()
 
 # Get or set default mode
@@ -160,9 +166,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 message_thread_id=topic_id
             )
         else:
-            # Bot mode: Send to admin PM
+            # Bot mode: Send to admin PM and store mapping if needed (for info, optional)
             send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
-            await send_func(
+            sent_msg = await send_func(
                 chat_id=ADMIN_ID,
                 photo=profile_photo_id if profile_photo_id else None,
                 caption=info_text if profile_photo_id else None,
@@ -170,6 +176,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=ban_button,
                 parse_mode=ParseMode.HTML
             )
+            # Optional: Store mapping for reply to info msg if desired, but skip for now
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward private messages to the admin."""
@@ -216,7 +223,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
         )
     else:
-        # Bot mode: Forward to admin PM
+        # Bot mode: Forward to admin PM and store mapping
         if is_banned:
             await update.message.reply_text("🚫 You are banned by the admin.")
 
@@ -225,6 +232,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             from_chat_id=update.message.chat_id,
             message_id=update.message.message_id
         )
+        cur.execute('INSERT OR REPLACE INTO message_mappings (msg_id, user_id) VALUES (?, ?)', (sent_msg.message_id, user_id))
+        conn.commit()
 
         if is_banned:
             await context.bot.send_message(
@@ -247,10 +256,13 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if reply_to.text == "Banned Msg: 🤫" and reply_to.reply_to_message:
         reply_to = reply_to.reply_to_message
 
-    if not reply_to.forward_from:
+    # Get user_id from mapping
+    cur.execute('SELECT user_id FROM message_mappings WHERE msg_id = ?', (reply_to.message_id,))
+    row = cur.fetchone()
+    if not row:
         return
 
-    user_id = reply_to.forward_from.id
+    user_id = row[0]
 
     # Check ban
     cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
