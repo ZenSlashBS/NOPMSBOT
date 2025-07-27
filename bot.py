@@ -5,7 +5,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # Environment variables (do not hardcode!)
 TOKEN = os.getenv('BOT_TOKEN')
-GROUP_ID = int(os.getenv('GROUP_ID'))  # e.g., -1001234567890 (must be a forum group with topics enabled)
+GROUP_ID = int(os.getenv('GROUP_ID'))  # e.g., -1001234567890 (forum group with topics)
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))  # Your Telegram user ID; default 0 (which won't match anyone)
 
 # Database for mapping users to topics
 conn = sqlite3.connect('mappings.db')
@@ -43,7 +44,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
         conn.commit()
 
-    # Copy the message to the topic (use copy to avoid revealing user details if desired; forward shows sender)
+    # Copy the message to the topic
     await context.bot.copy_message(
         chat_id=GROUP_ID,
         from_chat_id=update.message.chat_id,
@@ -52,13 +53,18 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward replies from group topics back to users."""
+    """Forward replies from group topics back to users, only if from admin."""
     if update.message.chat_id != GROUP_ID:
         return
 
     topic_id = update.message.message_thread_id
     if not topic_id:
         return  # Ignore general topic
+
+    # Check if sender is admin
+    sender_id = update.message.from_user.id
+    if sender_id != ADMIN_ID:
+        return  # Ignore non-admin replies
 
     # Find the user associated with this topic
     cur.execute('SELECT user_id FROM mappings WHERE topic_id = ?', (topic_id,))
@@ -68,7 +74,7 @@ async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = row[0]
 
-    # Copy the reply to the user (hides group details)
+    # Copy the reply to the user
     await context.bot.copy_message(
         chat_id=user_id,
         from_chat_id=update.message.chat_id,
@@ -81,9 +87,7 @@ def main() -> None:
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
-    # Handle all private messages (text, media, etc.)
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
-    # Handle messages in the group (assumes replies are in topics)
     application.add_handler(MessageHandler(filters.ChatType.GROUPS, handle_group_reply))
 
     # Start polling
