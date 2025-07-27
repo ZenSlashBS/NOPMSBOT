@@ -47,12 +47,6 @@ cur.execute('''
         value TEXT
     )
 ''')
-cur.execute('''
-    CREATE TABLE IF NOT EXISTS message_mappings (
-        group_msg_id INTEGER PRIMARY KEY,
-        user_id INTEGER
-    )
-''')
 conn.commit()
 
 # Get or set default mode
@@ -61,7 +55,6 @@ mode_row = cur.fetchone()
 if not mode_row:
     cur.execute('INSERT INTO settings (key, value) VALUES ("msg_mode", "topic")')
     conn.commit()
-MSG_MODE = "topic"  # Initial, but will reload in functions
 
 def get_mode():
     cur.execute('SELECT value FROM settings WHERE key = "msg_mode"')
@@ -105,7 +98,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         admin_text = (
             "👋 Welcome, Admin!\n\n"
             "🛠️ Modes Explanation:\n"
-            "- 🤖 Bot Msg Mode: User messages are forwarded to the general group chat. To reply, reply directly to the message in the group (the bot will detect and send to the user).\n"
+            "- 🤖 Bot Msg Mode: User messages are forwarded to your PM with the bot (with forward tag). To reply, reply to the forwarded message in your PM with the bot.\n"
             "- 📂 Topic Msg Mode (Default): User messages create separate topics in the group for organized threaded conversations.\n\n"
             "📢 Other Commands:\n"
             "- /broadcast Msg -btnname:btnlink, ... --imglink.jpg: Send broadcast to all users.\n"
@@ -147,7 +140,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
     if is_first:
-        # Notify group on first start
+        # Notify admin on first start
         premium_status = "⭐ Premium" if is_premium else "Non-Premium"
         username_display = f'@{username}' if username else 'NONE'
         direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
@@ -160,26 +153,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await send_func(
                 chat_id=GROUP_ID,
                 photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else info_text,
+                caption=info_text if profile_photo_id else None,
                 text=info_text if not profile_photo_id else None,
                 reply_markup=ban_button,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=topic_id
             )
         else:
-            # Bot mode: Send to general and store msg id if needed (but for info, no)
+            # Bot mode: Send to admin PM
             send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
             await send_func(
-                chat_id=GROUP_ID,
+                chat_id=ADMIN_ID,
                 photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else info_text,
+                caption=info_text if profile_photo_id else None,
                 text=info_text if not profile_photo_id else None,
                 reply_markup=ban_button,
                 parse_mode=ParseMode.HTML
             )
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward private messages to the group."""
+    """Forward private messages to the admin."""
     user_id = update.message.from_user.id
 
     # Check if banned
@@ -187,18 +180,15 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     row = cur.fetchone()
     is_banned = row[0] if row else 0
 
-    if is_banned:
-        await update.message.reply_text("🚫 You are banned by the admin.")
-        msg_prefix = "Banned Msg: 🤫 "
-    else:
-        msg_prefix = ""
-
-    user_name = update.message.from_user.full_name
-
     current_mode = get_mode()
 
     if current_mode == "topic":
-        # Topic mode
+        if is_banned:
+            await update.message.reply_text("🚫 You are banned by the admin.")
+        msg_prefix = "Banned Msg: 🤫 " if is_banned else ""
+
+        user_name = update.message.from_user.full_name
+
         cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
         row = cur.fetchone()
 
@@ -218,7 +208,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text("Sorry, there was an internal error. Please try again later.")
                 return
 
-        # Copy to topic
         await context.bot.copy_message(
             chat_id=GROUP_ID,
             from_chat_id=update.message.chat_id,
@@ -227,54 +216,41 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
         )
     else:
-        # Bot mode: Copy to general, store msg id
-        sent_msg = await context.bot.copy_message(
-            chat_id=GROUP_ID,
+        # Bot mode: Forward to admin PM
+        if is_banned:
+            await update.message.reply_text("🚫 You are banned by the admin.")
+
+        sent_msg = await context.bot.forward_message(
+            chat_id=ADMIN_ID,
             from_chat_id=update.message.chat_id,
-            message_id=update.message.message_id,
-            caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
+            message_id=update.message.message_id
         )
-        cur.execute('INSERT OR REPLACE INTO message_mappings (group_msg_id, user_id) VALUES (?, ?)', (sent_msg.message_id, user_id))
-        conn.commit()
 
-async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward replies from group back to users, only if from admin and user not banned."""
-    if update.message.chat_id != GROUP_ID:
+        if is_banned:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="Banned Msg: 🤫",
+                reply_to_message_id=sent_msg.message_id
+            )
+
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle replies from admin in PM to bot."""
+    if update.message.from_user.id != ADMIN_ID:
         return
 
-    sender_id = update.message.from_user.id
-    if sender_id != ADMIN_ID:
+    if not update.message.reply_to_message:
         return
 
-    current_mode = get_mode()
+    reply_to = update.message.reply_to_message
 
-    if current_mode == "topic":
-        topic_id = update.message.message_thread_id
-        if not topic_id:
-            return
+    # If replied to "Banned Msg", get the original
+    if reply_to.text == "Banned Msg: 🤫" and reply_to.reply_to_message:
+        reply_to = reply_to.reply_to_message
 
-        cur.execute('SELECT user_id FROM mappings WHERE topic_id = ?', (topic_id,))
-        row = cur.fetchone()
-        if not row:
-            return
+    if not reply_to.forward_from:
+        return
 
-        user_id = row[0]
-    else:
-        # Bot mode
-        if not update.message.reply_to_message:
-            return
-
-        reply_to_msg = update.message.reply_to_message
-        if reply_to_msg.from_user.id != context.bot.id:
-            return  # Not replying to bot's message
-
-        reply_to_id = reply_to_msg.message_id
-        cur.execute('SELECT user_id FROM message_mappings WHERE group_msg_id = ?', (reply_to_id,))
-        row = cur.fetchone()
-        if not row:
-            return
-
-        user_id = row[0]
+    user_id = reply_to.forward_from.id
 
     # Check ban
     cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
@@ -283,7 +259,42 @@ async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("🚫 Unban the user first to reply.")
         return
 
-    # Forward reply
+    # Send to user
+    await context.bot.copy_message(
+        chat_id=user_id,
+        from_chat_id=update.message.chat_id,
+        message_id=update.message.message_id
+    )
+
+async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward replies from group topics back to users (for topic mode)."""
+    if update.message.chat_id != GROUP_ID:
+        return
+
+    if get_mode() != "topic":
+        return
+
+    topic_id = update.message.message_thread_id
+    if not topic_id:
+        return
+
+    sender_id = update.message.from_user.id
+    if sender_id != ADMIN_ID:
+        return
+
+    cur.execute('SELECT user_id FROM mappings WHERE topic_id = ?', (topic_id,))
+    row = cur.fetchone()
+    if not row:
+        return
+
+    user_id = row[0]
+
+    cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
+    ban_row = cur.fetchone()
+    if ban_row and ban_row[0]:
+        await update.message.reply_text("🚫 Unban the user first to reply.")
+        return
+
     await context.bot.copy_message(
         chat_id=user_id,
         from_chat_id=update.message.chat_id,
@@ -300,7 +311,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         cur.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("msg_mode", ?)', (new_mode,))
         conn.commit()
 
-        # Update buttons
         topic_emoji = " ✅" if new_mode == "topic" else ""
         bot_emoji = " ✅" if new_mode == "bot" else ""
         new_markup = InlineKeyboardMarkup([[
@@ -423,7 +433,8 @@ def main() -> None:
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(ADMIN_ID), handle_private_message))
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.User(ADMIN_ID) & ~filters.COMMAND, handle_admin_reply))
     application.add_handler(MessageHandler(filters.ChatType.GROUPS, handle_group_reply))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(CommandHandler("broadcast", broadcast))
