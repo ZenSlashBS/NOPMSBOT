@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, UserProfilePhotos, ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, UserProfilePhotos
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import BadRequest
 
@@ -80,9 +81,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_first:
         # Notify group only on first start
         premium_status = "⭐ Premium" if is_premium else "Non-Premium"
-        username_display = username if username else 'NONE'
+        username_display = f'@{username}' if username else 'NONE'
         direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
-        info_text = f'🆕 New user started the bot!<br>Name: {first_name}<br>ID: <a href="tg://user?id={user_id}">{user_id}</a><br>Username: {username_display}<br>Status: {premium_status}<br>Direct: {direct_link}'
+        info_text = f'🆕 New user started the bot!\nName: {first_name}\nID: <a href="tg://user?id={user_id}">{user_id}</a>\nUsername: {username_display}\nStatus: {premium_status}\nDirect: {direct_link}'
 
         ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
 
@@ -202,13 +203,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message = query.message
 
         # Build user markup (without action buttons)
-        # Assume original markup has user buttons in first rows, action in last
         original_markup = message.reply_markup.inline_keyboard
         user_rows = original_markup[:-1]  # Exclude last row (action)
         user_markup = InlineKeyboardMarkup(user_rows) if user_rows else None
 
-        # Remove all buttons from preview
-        await query.edit_message_reply_markup(reply_markup=None)
+        # Edit preview to remove action buttons, keep user buttons
+        await query.edit_message_reply_markup(reply_markup=user_markup)
 
         # Broadcast to all users
         cur.execute('SELECT user_id FROM users')
@@ -218,9 +218,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             uid = row[0]
             try:
                 if message.photo:
-                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption, reply_markup=user_markup, parse_mode=ParseMode.HTML)
+                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption, reply_markup=user_markup)
                 else:
-                    await context.bot.send_message(chat_id=uid, text=message.text, reply_markup=user_markup, parse_mode=ParseMode.HTML)
+                    await context.bot.send_message(chat_id=uid, text=message.text, reply_markup=user_markup)
                 sent_count += 1
             except Exception as e:
                 logger.warning(f"Failed to send to {uid}: {e}")
