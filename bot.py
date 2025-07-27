@@ -41,7 +41,31 @@ cur.execute('''
         banned INTEGER DEFAULT 0
     )
 ''')
+cur.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+''')
+cur.execute('''
+    CREATE TABLE IF NOT EXISTS message_mappings (
+        group_msg_id INTEGER PRIMARY KEY,
+        user_id INTEGER
+    )
+''')
 conn.commit()
+
+# Get or set default mode
+cur.execute('SELECT value FROM settings WHERE key = "msg_mode"')
+mode_row = cur.fetchone()
+if not mode_row:
+    cur.execute('INSERT INTO settings (key, value) VALUES ("msg_mode", "topic")')
+    conn.commit()
+MSG_MODE = "topic"  # Initial, but will reload in functions
+
+def get_mode():
+    cur.execute('SELECT value FROM settings WHERE key = "msg_mode"')
+    return cur.fetchone()[0]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command in PM."""
@@ -69,7 +93,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cur.execute('INSERT OR IGNORE INTO bans (user_id) VALUES (?)', (user_id,))
     conn.commit()
 
-    # Welcome message with button
+    if user_id == ADMIN_ID:
+        # Admin specific message
+        current_mode = get_mode()
+        topic_emoji = " ✅" if current_mode == "topic" else ""
+        bot_emoji = " ✅" if current_mode == "bot" else ""
+        mode_buttons = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🤖 Bot Msg Mode{bot_emoji}", callback_data="set_mode:bot"),
+            InlineKeyboardButton(f"📂 Topic Msg Mode{topic_emoji}", callback_data="set_mode:topic")
+        ]])
+        admin_text = (
+            "👋 Welcome, Admin!\n\n"
+            "🛠️ Modes Explanation:\n"
+            "- 🤖 Bot Msg Mode: User messages are forwarded to the general group chat. To reply, reply directly to the message in the group (the bot will detect and send to the user).\n"
+            "- 📂 Topic Msg Mode (Default): User messages create separate topics in the group for organized threaded conversations.\n\n"
+            "📢 Other Commands:\n"
+            "- /broadcast Msg -btnname:btnlink, ... --imglink.jpg: Send broadcast to all users.\n"
+            "- /users: See total number of users.\n\n"
+            "Select mode below:"
+        )
+        await update.message.reply_text(admin_text, reply_markup=mode_buttons)
+        return
+
+    # Regular user welcome
     button = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 HazexPy", url="t.me/HazexPy")]])
     welcome_text = f"👋 Welcome, {first_name}! Send me any message, and I'll forward it to the owner anonymously."
 
@@ -78,26 +124,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(welcome_text, reply_markup=button)
 
-    # Create or get topic
-    cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-    row = cur.fetchone()
-    if row:
-        topic_id = row[0]
-    else:
-        try:
-            new_topic = await context.bot.create_forum_topic(
-                chat_id=GROUP_ID,
-                name=f"Message from {first_name} ({user_id})"
-            )
-            topic_id = new_topic.message_thread_id
-            cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
-            conn.commit()
-        except BadRequest as e:
-            logger.error(f"Failed to create topic: {e}")
-            return  # No notification if can't create topic
+    current_mode = get_mode()
+
+    # Create or get topic if topic mode
+    topic_id = None
+    if current_mode == "topic":
+        cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
+        row = cur.fetchone()
+        if row:
+            topic_id = row[0]
+        else:
+            try:
+                new_topic = await context.bot.create_forum_topic(
+                    chat_id=GROUP_ID,
+                    name=f"Message from {first_name} ({user_id})"
+                )
+                topic_id = new_topic.message_thread_id
+                cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
+                conn.commit()
+            except BadRequest as e:
+                logger.error(f"Failed to create topic: {e}")
+                return
 
     if is_first:
-        # Notify group only on first start, in the user's topic
+        # Notify group on first start
         premium_status = "⭐ Premium" if is_premium else "Non-Premium"
         username_display = f'@{username}' if username else 'NONE'
         direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
@@ -105,13 +155,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
 
-        if profile_photo_id:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=profile_photo_id, caption=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
+        if current_mode == "topic":
+            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+            await send_func(
+                chat_id=GROUP_ID,
+                photo=profile_photo_id if profile_photo_id else None,
+                caption=info_text if profile_photo_id else info_text,
+                text=info_text if not profile_photo_id else None,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=topic_id
+            )
         else:
-            await context.bot.send_message(chat_id=GROUP_ID, text=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML, message_thread_id=topic_id)
+            # Bot mode: Send to general and store msg id if needed (but for info, no)
+            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+            await send_func(
+                chat_id=GROUP_ID,
+                photo=profile_photo_id if profile_photo_id else None,
+                caption=info_text if profile_photo_id else info_text,
+                text=info_text if not profile_photo_id else None,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML
+            )
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward private messages to the group topic."""
+    """Forward private messages to the group."""
     user_id = update.message.from_user.id
 
     # Check if banned
@@ -127,58 +195,88 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     user_name = update.message.from_user.full_name
 
-    # Check if topic exists
-    cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-    row = cur.fetchone()
+    current_mode = get_mode()
 
-    if row:
-        topic_id = row[0]
+    if current_mode == "topic":
+        # Topic mode
+        cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
+        row = cur.fetchone()
+
+        if row:
+            topic_id = row[0]
+        else:
+            try:
+                new_topic = await context.bot.create_forum_topic(
+                    chat_id=GROUP_ID,
+                    name=f"Message from {user_name} ({user_id})"
+                )
+                topic_id = new_topic.message_thread_id
+                cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
+                conn.commit()
+            except BadRequest as e:
+                logger.error(f"Failed to create topic: {e}")
+                await update.message.reply_text("Sorry, there was an internal error. Please try again later.")
+                return
+
+        # Copy to topic
+        await context.bot.copy_message(
+            chat_id=GROUP_ID,
+            from_chat_id=update.message.chat_id,
+            message_id=update.message.message_id,
+            message_thread_id=topic_id,
+            caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
+        )
     else:
-        try:
-            new_topic = await context.bot.create_forum_topic(
-                chat_id=GROUP_ID,
-                name=f"Message from {user_name} ({user_id})"
-            )
-            topic_id = new_topic.message_thread_id
-            cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
-            conn.commit()
-        except BadRequest as e:
-            logger.error(f"Failed to create topic: {e}")
-            await update.message.reply_text("Sorry, there was an internal error. Please try again later.")
-            return
-
-    # Copy the message to the topic
-    await context.bot.copy_message(
-        chat_id=GROUP_ID,
-        from_chat_id=update.message.chat_id,
-        message_id=update.message.message_id,
-        message_thread_id=topic_id,
-        caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
-    )
+        # Bot mode: Copy to general, store msg id
+        sent_msg = await context.bot.copy_message(
+            chat_id=GROUP_ID,
+            from_chat_id=update.message.chat_id,
+            message_id=update.message.message_id,
+            caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
+        )
+        cur.execute('INSERT OR REPLACE INTO message_mappings (group_msg_id, user_id) VALUES (?, ?)', (sent_msg.message_id, user_id))
+        conn.commit()
 
 async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward replies from group topics back to users, only if from admin and user not banned."""
+    """Forward replies from group back to users, only if from admin and user not banned."""
     if update.message.chat_id != GROUP_ID:
         return
 
-    topic_id = update.message.message_thread_id
-    if not topic_id:
-        return
-
-    # Check if sender is admin
     sender_id = update.message.from_user.id
     if sender_id != ADMIN_ID:
         return
 
-    # Find user
-    cur.execute('SELECT user_id FROM mappings WHERE topic_id = ?', (topic_id,))
-    row = cur.fetchone()
-    if not row:
-        return
+    current_mode = get_mode()
 
-    user_id = row[0]
+    if current_mode == "topic":
+        topic_id = update.message.message_thread_id
+        if not topic_id:
+            return
 
-    # Check if banned
+        cur.execute('SELECT user_id FROM mappings WHERE topic_id = ?', (topic_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+
+        user_id = row[0]
+    else:
+        # Bot mode
+        if not update.message.reply_to_message:
+            return
+
+        reply_to_msg = update.message.reply_to_message
+        if reply_to_msg.from_user.id != context.bot.id:
+            return  # Not replying to bot's message
+
+        reply_to_id = reply_to_msg.message_id
+        cur.execute('SELECT user_id FROM message_mappings WHERE group_msg_id = ?', (reply_to_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+
+        user_id = row[0]
+
+    # Check ban
     cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
     ban_row = cur.fetchone()
     if ban_row and ban_row[0]:
@@ -193,20 +291,34 @@ async def handle_group_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries for ban/unban and broadcast."""
+    """Handle callback queries."""
     query = update.callback_query
     data = query.data
+
+    if data.startswith("set_mode:"):
+        new_mode = data.split(":")[1]
+        cur.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("msg_mode", ?)', (new_mode,))
+        conn.commit()
+
+        # Update buttons
+        topic_emoji = " ✅" if new_mode == "topic" else ""
+        bot_emoji = " ✅" if new_mode == "bot" else ""
+        new_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🤖 Bot Msg Mode{bot_emoji}", callback_data="set_mode:bot"),
+            InlineKeyboardButton(f"📂 Topic Msg Mode{topic_emoji}", callback_data="set_mode:topic")
+        ]])
+        await query.edit_message_reply_markup(reply_markup=new_markup)
+        await query.answer(f"Mode set to {new_mode.capitalize()} Msg Mode ✅")
+        return
 
     if data.startswith("ban:") or data.startswith("unban:"):
         user_id = int(data.split(":")[1])
         is_ban = data.startswith("ban:")
 
-        # Update ban status
         new_banned = 1 if is_ban else 0
         cur.execute('UPDATE bans SET banned = ? WHERE user_id = ?', (new_banned, user_id))
         conn.commit()
 
-        # New button
         new_text = "✅ Unban" if is_ban else "🚫 Ban"
         new_data = f"unban:{user_id}" if is_ban else f"ban:{user_id}"
         new_markup = InlineKeyboardMarkup([[InlineKeyboardButton(new_text, callback_data=new_data)]])
@@ -217,18 +329,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "broadcast_post":
         await query.answer("Broadcasting... 📢")
 
-        # Get message
         message = query.message
 
-        # Build user markup (without action buttons)
         original_markup = message.reply_markup.inline_keyboard
-        user_rows = original_markup[:-1]  # Exclude last row (action)
+        user_rows = original_markup[:-1]
         user_markup = InlineKeyboardMarkup(user_rows) if user_rows else None
 
-        # Edit preview to remove action buttons, keep user buttons
         await query.edit_message_reply_markup(reply_markup=user_markup)
 
-        # Broadcast to all users
         cur.execute('SELECT user_id FROM users')
         users = cur.fetchall()
         sent_count = 0
@@ -259,7 +367,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /broadcast Msg -btnname:btnlink, btnname:btnlink --imglink.jpg")
         return
 
-    # Parse args
     if "--" in args:
         msg_buttons, img_url = args.split("--", 1)
         img_url = img_url.strip()
@@ -280,21 +387,17 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = msg_buttons.strip()
         buttons = []
 
-    # Build user markup
     user_rows = [[InlineKeyboardButton(name, url=link)] for name, link in buttons]
     user_markup = InlineKeyboardMarkup(user_rows) if buttons else None
 
-    # Action row
     action_row = [
         InlineKeyboardButton("📤 Post", callback_data="broadcast_post"),
         InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")
     ]
 
-    # Full markup for preview
     full_rows = user_rows + [action_row]
     full_markup = InlineKeyboardMarkup(full_rows)
 
-    # Send preview
     if img_url:
         try:
             await update.message.reply_photo(photo=img_url, caption=msg, reply_markup=full_markup, parse_mode=ParseMode.HTML)
