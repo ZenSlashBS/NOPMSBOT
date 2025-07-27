@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, UserProfilePhotos
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, UserProfilePhotos, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import BadRequest
 
@@ -56,6 +56,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if photos.total_count > 0:
         profile_photo_id = photos.photos[0][-1].file_id  # Largest photo
 
+    # Check if first time
+    cur.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
+    is_first = not cur.fetchone()
+
     # Insert or update user in DB
     cur.execute('''
         INSERT OR REPLACE INTO users (user_id, username, first_name, is_premium, profile_photo_id)
@@ -73,17 +77,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(welcome_text, reply_markup=button)
 
-    # Notify group
-    premium_status = "⭐ Premium" if is_premium else "Non-Premium"
-    direct_link = f"t.me/{username}" if username else "No username (cannot direct message)"
-    info_text = f"🆕 New user started the bot!\nName: {first_name}\nID: {user_id}\nUsername: @{username or 'None'}\nStatus: {premium_status}\nDirect: {direct_link}"
+    if is_first:
+        # Notify group only on first start
+        premium_status = "⭐ Premium" if is_premium else "Non-Premium"
+        username_display = username if username else 'NONE'
+        direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
+        info_text = f'🆕 New user started the bot!<br>Name: {first_name}<br>ID: <a href="tg://user?id={user_id}">{user_id}</a><br>Username: {username_display}<br>Status: {premium_status}<br>Direct: {direct_link}'
 
-    ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
+        ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
 
-    if profile_photo_id:
-        await context.bot.send_photo(chat_id=GROUP_ID, photo=profile_photo_id, caption=info_text, reply_markup=ban_button)
-    else:
-        await context.bot.send_message(chat_id=GROUP_ID, text=info_text, reply_markup=ban_button)
+        if profile_photo_id:
+            await context.bot.send_photo(chat_id=GROUP_ID, photo=profile_photo_id, caption=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML)
+        else:
+            await context.bot.send_message(chat_id=GROUP_ID, text=info_text, reply_markup=ban_button, parse_mode=ParseMode.HTML)
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward private messages to the group topic."""
@@ -122,7 +128,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("Sorry, there was an internal error. Please try again later.")
             return
 
-    # Forward with prefix if banned
+    # Copy the message to the topic
     await context.bot.copy_message(
         chat_id=GROUP_ID,
         from_chat_id=update.message.chat_id,
@@ -192,12 +198,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "broadcast_post":
         await query.answer("Broadcasting... 📢")
 
-        # Remove action buttons
+        # Get message
         message = query.message
-        user_markup = None  # Assume we build it or none
-        # For simplicity, set to None to remove all buttons (since user buttons are urls, not callbacks)
-        # If had user buttons, need to preserve, but since url buttons no callback, can set markup=None to remove all, but wait user wants remove default only
-        # But to avoid errors, remove all buttons after post
+
+        # Build user markup (without action buttons)
+        # Assume original markup has user buttons in first rows, action in last
+        original_markup = message.reply_markup.inline_keyboard
+        user_rows = original_markup[:-1]  # Exclude last row (action)
+        user_markup = InlineKeyboardMarkup(user_rows) if user_rows else None
+
+        # Remove all buttons from preview
         await query.edit_message_reply_markup(reply_markup=None)
 
         # Broadcast to all users
@@ -208,9 +218,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             uid = row[0]
             try:
                 if message.photo:
-                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption)
+                    await context.bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption, reply_markup=user_markup, parse_mode=ParseMode.HTML)
                 else:
-                    await context.bot.send_message(chat_id=uid, text=message.text)
+                    await context.bot.send_message(chat_id=uid, text=message.text, reply_markup=user_markup, parse_mode=ParseMode.HTML)
                 sent_count += 1
             except Exception as e:
                 logger.warning(f"Failed to send to {uid}: {e}")
@@ -262,7 +272,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")
     ]
 
-    # Full markup
+    # Full markup for preview
     full_rows = user_rows + [action_row]
     full_markup = InlineKeyboardMarkup(full_rows)
 
