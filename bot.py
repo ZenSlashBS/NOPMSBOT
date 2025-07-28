@@ -151,29 +151,44 @@ async def notify_admin_if_first(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = GROUP_ID if current_mode == "topic" else ADMIN_ID
     thread_id = topic_id if current_mode == "topic" else None
 
-    send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
     try:
-        await send_func(
-            chat_id=chat_id,
-            photo=profile_photo_id if profile_photo_id else None,
-            caption=info_text if profile_photo_id else None,
-            text=info_text if not profile_photo_id else None,
-            reply_markup=ban_button,
-            parse_mode=ParseMode.HTML,
-            message_thread_id=thread_id
-        )
+        if profile_photo_id:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=profile_photo_id,
+                caption=info_text,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=thread_id
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=info_text,
+                reply_markup=ban_button,
+                parse_mode=ParseMode.HTML,
+                message_thread_id=thread_id
+            )
     except BadRequest as e:
         if "message thread not found" in e.message.lower() and current_mode == "topic":
             topic_id = await create_topic_if_not_exists(user_id, first_name, context)
-            await send_func(
-                chat_id=chat_id,
-                photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else None,
-                text=info_text if not profile_photo_id else None,
-                reply_markup=ban_button,
-                parse_mode=ParseMode.HTML,
-                message_thread_id=topic_id
-            )
+            if profile_photo_id:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=profile_photo_id,
+                    caption=info_text,
+                    reply_markup=ban_button,
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=topic_id
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=info_text,
+                    reply_markup=ban_button,
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=topic_id
+                )
         else:
             raise
 
