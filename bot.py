@@ -66,8 +66,8 @@ def get_mode():
     cur.execute('SELECT value FROM settings WHERE key = "msg_mode"')
     return cur.fetchone()[0]
 
-async def add_user_and_notify_if_first(update: Update, context: ContextTypes.DEFAULT_TYPE, is_start: bool = False) -> bool:
-    """Add user to DB and notify if first time. Returns if it was first."""
+async def add_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Add or update user in DB. Returns if it was the first time."""
     user = update.message.from_user
     user_id = user.id
     username = user.username
@@ -92,25 +92,81 @@ async def add_user_and_notify_if_first(update: Update, context: ContextTypes.DEF
     cur.execute('INSERT OR IGNORE INTO bans (user_id) VALUES (?)', (user_id,))
     conn.commit()
 
-    if is_first:
-        # Notify admin on first start/message
-        premium_status = "⭐ Premium" if is_premium else "Non-Premium"
-        username_display = f'@{username}' if username else 'NONE'
-        direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
-        info_text = f'🆕 New user {"started the bot" if is_start else "sent a message"}!\nName: {first_name}\nID: <a href="tg://user?id={user_id}">{user_id}</a>\nUsername: {username_display}\nStatus: {premium_status}\nDirect: {direct_link}'
+    return is_first
 
-        ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
+async def create_topic_if_not_exists(user_id: int, user_name: str, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Create or get topic ID for user in topic mode."""
+    cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
 
-        current_mode = get_mode()
+    try:
+        new_topic = await context.bot.create_forum_topic(
+            chat_id=GROUP_ID,
+            name=f"Message from {user_name} ({user_id})"
+        )
+        topic_id = new_topic.message_thread_id
+        cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
+        conn.commit()
+        return topic_id
+    except BadRequest as e:
+        logger.error(f"Failed to create topic: {e}")
+        raise
 
-        if current_mode == "topic":
-            # For topic mode, need topic_id
-            cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-            row = cur.fetchone()
-            topic_id = row[0] if row else None  # Assume created in caller if needed
-            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message to user."""
+    user = update.message.from_user
+    user_id = user.id
+    first_name = user.first_name or "User"
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 HazexPy", url="t.me/HazexPy")]])
+    welcome_text = f"👋 Welcome, {first_name}! Send me any message, and I'll forward it to the owner anonymously."
+
+    cur.execute('SELECT profile_photo_id FROM users WHERE user_id = ?', (user_id,))
+    profile_photo_id = cur.fetchone()[0]
+
+    if profile_photo_id:
+        await update.message.reply_photo(photo=profile_photo_id, caption=welcome_text, reply_markup=button)
+    else:
+        await update.message.reply_text(welcome_text, reply_markup=button)
+
+async def notify_admin_if_first(update: Update, context: ContextTypes.DEFAULT_TYPE, topic_id: int | None = None) -> None:
+    """Notify admin if this is the user's first interaction."""
+    user = update.message.from_user
+    user_id = user.id
+    first_name = user.first_name or "User"
+    username = user.username
+    is_premium = 1 if user.is_premium else 0
+    cur.execute('SELECT profile_photo_id FROM users WHERE user_id = ?', (user_id,))
+    profile_photo_id = cur.fetchone()[0]
+
+    premium_status = "⭐ Premium" if is_premium else "Non-Premium"
+    username_display = f'@{username}' if username else 'NONE'
+    direct_link = f'<a href="tg://user?id={user_id}">Message User</a>'
+    info_text = f'🆕 New user interacted!\nName: {first_name}\nID: <a href="tg://user?id={user_id}">{user_id}</a>\nUsername: {username_display}\nStatus: {premium_status}\nDirect: {direct_link}'
+
+    ban_button = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Ban", callback_data=f"ban:{user_id}")]])
+
+    current_mode = get_mode()
+    chat_id = GROUP_ID if current_mode == "topic" else ADMIN_ID
+    thread_id = topic_id if current_mode == "topic" else None
+
+    send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
+    try:
+        await send_func(
+            chat_id=chat_id,
+            photo=profile_photo_id if profile_photo_id else None,
+            caption=info_text if profile_photo_id else None,
+            text=info_text if not profile_photo_id else None,
+            reply_markup=ban_button,
+            parse_mode=ParseMode.HTML,
+            message_thread_id=thread_id
+        )
+    except BadRequest as e:
+        if "message thread not found" in e.message.lower() and current_mode == "topic":
+            topic_id = await create_topic_if_not_exists(user_id, first_name, context)
             await send_func(
-                chat_id=GROUP_ID,
+                chat_id=chat_id,
                 photo=profile_photo_id if profile_photo_id else None,
                 caption=info_text if profile_photo_id else None,
                 text=info_text if not profile_photo_id else None,
@@ -119,17 +175,7 @@ async def add_user_and_notify_if_first(update: Update, context: ContextTypes.DEF
                 message_thread_id=topic_id
             )
         else:
-            send_func = context.bot.send_photo if profile_photo_id else context.bot.send_message
-            await send_func(
-                chat_id=ADMIN_ID,
-                photo=profile_photo_id if profile_photo_id else None,
-                caption=info_text if profile_photo_id else None,
-                text=info_text if not profile_photo_id else None,
-                reply_markup=ban_button,
-                parse_mode=ParseMode.HTML
-            )
-
-    return is_first
+            raise
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command in PM."""
@@ -157,89 +203,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(admin_text, reply_markup=mode_buttons)
         return
 
-    # Add user and notify if first
-    await add_user_and_notify_if_first(update, context, is_start=True)
-
-    # Regular user welcome
-    user = update.message.from_user
-    first_name = user.first_name or "User"
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 HazexPy", url="t.me/HazexPy")]])
-    welcome_text = f"👋 Welcome, {first_name}! Send me any message, and I'll forward it to the owner anonymously."
-
-    cur.execute('SELECT profile_photo_id FROM users WHERE user_id = ?', (user_id,))
-    profile_photo_id = cur.fetchone()[0]
-
-    if profile_photo_id:
-        await update.message.reply_photo(photo=profile_photo_id, caption=welcome_text, reply_markup=button)
-    else:
-        await update.message.reply_text(welcome_text, reply_markup=button)
+    # Add or update user
+    is_first = await add_or_update_user(update, context)
 
     current_mode = get_mode()
-
-    # Create topic if topic mode and not exists
+    topic_id = None
     if current_mode == "topic":
-        cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-        if not cur.fetchone():
-            try:
-                new_topic = await context.bot.create_forum_topic(
-                    chat_id=GROUP_ID,
-                    name=f"Message from {first_name} ({user_id})"
-                )
-                topic_id = new_topic.message_thread_id
-                cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
-                conn.commit()
-            except BadRequest as e:
-                logger.error(f"Failed to create topic: {e}")
+        topic_id = await create_topic_if_not_exists(user_id, update.message.from_user.full_name, context)
+
+    if is_first:
+        await notify_admin_if_first(update, context, topic_id)
+
+    await send_welcome(update, context)
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward private messages to the admin."""
     user_id = update.message.from_user.id
 
-    # Add user and notify if first
-    await add_user_and_notify_if_first(update, context)
+    # Add or update user
+    is_first = await add_or_update_user(update, context)
+
+    current_mode = get_mode()
+    topic_id = None
+    if current_mode == "topic":
+        topic_id = await create_topic_if_not_exists(user_id, update.message.from_user.full_name, context)
+
+    if is_first:
+        await notify_admin_if_first(update, context, topic_id)
+        await send_welcome(update, context)
 
     # Check if banned
     cur.execute('SELECT banned FROM bans WHERE user_id = ?', (user_id,))
     row = cur.fetchone()
     is_banned = row[0] if row else 0
 
-    current_mode = get_mode()
-
     if current_mode == "topic":
         if is_banned:
             await update.message.reply_text("🚫 You are banned by the admin.")
         msg_prefix = "Banned Msg: 🤫 " if is_banned else ""
 
-        user_name = update.message.from_user.full_name
-
-        cur.execute('SELECT topic_id FROM mappings WHERE user_id = ?', (user_id,))
-        row = cur.fetchone()
-
-        if row:
-            topic_id = row[0]
-        else:
-            try:
-                new_topic = await context.bot.create_forum_topic(
+        try:
+            await context.bot.copy_message(
+                chat_id=GROUP_ID,
+                from_chat_id=update.message.chat_id,
+                message_id=update.message.message_id,
+                message_thread_id=topic_id,
+                caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
+            )
+        except BadRequest as e:
+            if "message thread not found" in e.message.lower():
+                topic_id = await create_topic_if_not_exists(user_id, update.message.from_user.full_name, context)
+                await context.bot.copy_message(
                     chat_id=GROUP_ID,
-                    name=f"Message from {user_name} ({user_id})"
+                    from_chat_id=update.message.chat_id,
+                    message_id=update.message.message_id,
+                    message_thread_id=topic_id,
+                    caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
                 )
-                topic_id = new_topic.message_thread_id
-                cur.execute('INSERT INTO mappings (user_id, topic_id) VALUES (?, ?)', (user_id, topic_id))
-                conn.commit()
-            except BadRequest as e:
-                logger.error(f"Failed to create topic: {e}")
-                await update.message.reply_text("Sorry, there was an internal error. Please try again later.")
-                return
-
-        await context.bot.copy_message(
-            chat_id=GROUP_ID,
-            from_chat_id=update.message.chat_id,
-            message_id=update.message.message_id,
-            message_thread_id=topic_id,
-            caption=msg_prefix + (update.message.caption or "") if update.message.caption else None
-        )
+            else:
+                raise
     else:
-        # Bot mode: Forward to admin PM and store mapping
         if is_banned:
             await update.message.reply_text("🚫 You are banned by the admin.")
 
